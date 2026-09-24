@@ -78,9 +78,10 @@ Patches:
   every patch applied during the build. This tool extracts it and then tries
   to retrieve the patch files themselves, in this order:
 
-    1. From a .patches/ directory in the APK control section. This needs no
-       source repository access at all -- anyone entitled to pull the APK can
-       read the patches that were applied to it.
+    1. From a .patches.tar in the APK control section. This needs no source
+       repository access at all -- anyone entitled to pull the APK can read
+       the patches that were applied to it. Nothing ships this yet, so it is
+       skipped silently when absent.
     2. From the melange build configuration repository referenced by the
        SBOM, checked out at the exact build commit. Wolfi's is public and
        needs no credentials; build configurations for enterprise packages
@@ -344,18 +345,35 @@ extract_melange_config() {
 
 # Extract patches embedded in the APK control section, if any are present.
 #
-# melange does not put them there yet, but this is the path that matters: it is
-# the only one that works for a customer holding an enterprise APK and no source
-# repository access. When melange starts shipping them, this lights up with no
-# further changes here.
+# This is the path that matters: it is the only one that works for a customer
+# holding an enterprise APK and no source repository access. Nothing ships
+# these yet, so their absence is the normal case and is not reported.
+#
+# The patches travel as a single flat .patches.tar. They cannot be a .patches/
+# directory: apk-tools rejects any control entry whose name contains a '/' and
+# refuses to install the package at all -- verified against both apk-tools
+# 2.14.10 ("archive does not contain expected data") and apk-tools 3.0.7 ("v2
+# package format error"). Flat entries of any size are fine; a 512KB control
+# payload installs without complaint on both.
 extract_embedded_patches() {
 	local apk_file="$1"
 	local outdir="$2"
-	mkdir -p "$outdir"
-	if tar zxf "$apk_file" -C "$outdir" --strip-components=1 --wildcards '.patches/*' 2>/dev/null; then
-		info "Extracted embedded patches from APK control section [$outdir]"
-		return 0
-	fi
+	local tmp= member=
+	tmp=$(mktemp)
+	for member in .patches.tar .patches.tar.gz; do
+		if tar zxOf "$apk_file" "$member" 2>/dev/null > "$tmp" && [ -s "$tmp" ]; then
+			mkdir -p "$outdir"
+			if tar xf "$tmp" -C "$outdir" 2>/dev/null; then
+				rm -f "$tmp"
+				# Patches shipped with the package came from the build that
+				# produced it, so they are exact, not a mirror copy.
+				echo "embedded" > "$outdir/.provenance"
+				info "Extracted embedded patches from APK control section [$outdir]"
+				return 0
+			fi
+		fi
+	done
+	rm -f "$tmp"
 	return 1
 }
 
@@ -471,7 +489,12 @@ collect_from_checkout() {
 		info "Collecting patches for [$pkg] ($provenance)"
 		cp -a "$supportdir/." "$outdir/"
 	fi
-	echo "$provenance" > "$outdir/.provenance"
+	# Patches that shipped inside the APK are already exact; do not downgrade
+	# them to 'mirror' just because we also consulted the mirror for the
+	# build configuration.
+	if [ "$(cat "$outdir/.provenance" 2>/dev/null)" != "embedded" ]; then
+		echo "$provenance" > "$outdir/.provenance"
+	fi
 	return 0
 }
 

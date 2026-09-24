@@ -73,22 +73,32 @@ make_apk() {
 	for p in "$@"; do
 		printf -- '--- a/x\n+++ b/x\n' > "$root/control/.patches/$p"
 	done
-	# Drop .patches entirely when no patches were requested, so we can model
-	# today's APKs, which do not ship them at all.
-	[ "$#" -eq 0 ] && rmdir "$root/control/.patches"
+	# apk-tools rejects control entries whose names contain a '/', so patches
+	# ship as a single flat .patches.tar rather than a .patches/ directory.
+	# With no patches we model today's APKs, which carry none at all.
+	if [ "$#" -gt 0 ]; then
+		tar cf "$root/control/.patches.tar" -C "$root/control/.patches" .
+	fi
+	rm -rf "$root/control/.patches"
 
 	# Name the members explicitly: real APK control sections store them
 	# unprefixed, and 'tar -C dir .' would store them as ./.melange.yaml
 	local members=".PKGINFO .melange.yaml"
-	[ -d "$root/control/.patches" ] && members="$members .patches"
+	[ -f "$root/control/.patches.tar" ] && members="$members .patches.tar"
 	tar cf "$root/control.tar" -C "$root/control" $members
 	# apk v2 control segments omit the end-of-archive marker so that the
-	# control and data gzip streams concatenate into one readable archive
+	# control and data gzip streams concatenate into one readable archive.
+	# Truncate at the exact end of the last member rather than stripping
+	# trailing NULs: .patches.tar ends in its own zero padding, and stripping
+	# would eat part of it.
 	python3 -c "
-import sys
-d = open('$root/control.tar','rb').read().rstrip(b'\x00')
-d += b'\x00' * ((-len(d)) % 512)
-open('$root/control.stripped.tar','wb').write(d)
+import io, tarfile
+raw = open('$root/control.tar','rb').read()
+tf = tarfile.open(fileobj=io.BytesIO(raw), mode='r:')
+end = 0
+for m in tf.getmembers():
+    end = m.offset_data + ((m.size + 511) // 512) * 512
+open('$root/control.stripped.tar','wb').write(raw[:end])
 "
 	gzip -9 -c "$root/control.stripped.tar" > "$root/control.tar.gz"
 	tar czf "$root/data.tar.gz" -C "$root/data" var
@@ -121,12 +131,17 @@ check "patches landed in the package patch dir" \
 	"applied-one.patch applied-two.patch nested.patch subpkg.patch" \
 	"$(cd "$(patchdir_for_pkg testpkg)" && ls *.patch | sort | tr '\n' ' ' | sed -e 's/ $//')"
 
+check "provenance recorded as embedded" \
+	"embedded" \
+	"$(cat "$(patchdir_for_pkg testpkg)/.provenance" 2>/dev/null)"
+
 echo "# summarize_patches with everything present"
 PATCH_REPO_DENIED=
 summarize_patches >/dev/null 2>&1
 MANIFEST="$WORK_DIR/patches/MANIFEST.txt"
 check "no patches reported missing" "0" "$(grep -c '^MISSING' "$MANIFEST" || true)"
 check "all four patches accounted for" "4" "$(grep -c '^OK' "$MANIFEST" || true)"
+check "embedded patches are not labelled MIRROR" "0" "$(grep -c '^MIRROR' "$MANIFEST" || true)"
 
 echo "# summarize_patches against a present-day APK that ships no patches"
 APK2="$TMP/testpkg-nopatches-1.0-r0.apk"

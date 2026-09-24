@@ -19,6 +19,12 @@ Options:
  --no-mirror			Do not fall back to the public wolfi-dev/os mirror
 				for build configurations that cannot be resolved at
 				the exact commit named in the SBOM
+ --apk-repo URL			Additional APK repository to search, repeatable.
+				With --image this is read from the image's
+				/etc/apk/repositories; with --sbom there is nothing
+				to read it from, so pass it here. Packages missing
+				from every listed repository are then looked for in
+				the authenticated enterprise repository.
  -d|--dry-run			Dry run (skip actual source downloads)
  -y|--yes			Automatically answer "y" to acknowledge the
  				warning prompt that this tool will use a lot of
@@ -54,6 +60,17 @@ Notes:
   to specify your Chainguard organization (e.g. --org example.com). Requires
   chainctl to be installed and authenticated. When using --image with a
   cgr.dev/ORG/image URL the org is auto-detected from the image name.
+
+  Authentication uses a token scoped to the APK registry, which carries your
+  own entitlement -- it needs no additional permissions on the organization.
+  If you are not logged in, a device flow prints a URL to visit and the run
+  continues once you authenticate.
+
+  Where chainctl cannot run -- in a container or a CI job, since it keeps its
+  credentials in the system keyring -- set CHAINGUARD_TOKEN to a token minted
+  elsewhere:
+
+    $ CHAINGUARD_TOKEN=$(chainctl auth token --audience apk.cgr.dev)
 
 Patches:
   Every Chainguard APK embeds the locked melange build configuration that
@@ -524,6 +541,15 @@ summarize_patches() {
 
 	info "Patch manifest written to [$manifest]"
 	info "Patches applied: [$total]  retrieved: [$((total-missing))]  from mirror: [$mirrored]  missing: [$missing]"
+	if [ -n "$APK_UNAVAILABLE" ]; then
+		local n=$(printf '%s' "$APK_UNAVAILABLE" | sort -u | grep -c . || true)
+		echo
+		echo "[$n] package(s) could not be downloaded at all, so the patches"
+		echo "applied to them cannot even be enumerated:"
+		echo
+		printf '%s' "$APK_UNAVAILABLE" | sort -u | sed -e '/^$/d' -e 's/^/  /'
+		echo
+	fi
 	if [ -n "$PATCH_REPO_DENIED" ]; then
 		echo
 		echo "The following build configuration repositories could not be read,"
@@ -580,7 +606,11 @@ package_to_sbom() {
 			fi
 			local apk_file="$WORK_DIR/artifacts/${pkg_name}-${pkg_version}.apk"
 			if ! download_apk "$pkg_name" "$pkg_version" "$pkg_arch" "$apk_file"; then
+				# Without the APK we cannot even read which patches were
+				# applied, so this is a strictly worse gap than a patch whose
+				# contents we merely could not fetch. Record it as such.
 				info "WARNING! Cannot download APK for [$package]"
+				APK_UNAVAILABLE="$APK_UNAVAILABLE$pkg_name-$pkg_version"$'\n'
 				return
 			fi
 			info "Extracting SBOM from [$apk_file] to [$sbom]"
@@ -645,8 +675,6 @@ download_apk() {
 			info "Trying enterprise repo [$url]"
 			if curl -fsSL -u "${IDENTITY}:${IDENTITY_TOKEN}" -o "$apk_file" "$url" 2>/dev/null; then
 				found=1
-			elif grant_apk_pull && curl -fsSL -u "${IDENTITY}:${IDENTITY_TOKEN}" -o "$apk_file" "$url" 2>/dev/null; then
-				found=1
 			fi
 		fi
 	fi
@@ -657,48 +685,64 @@ download_apk() {
 # Set up Chainguard authentication for enterprise APK access.
 # This is lazy (called on first enterprise APK) and idempotent (runs only once).
 setup_chainguard_auth() {
-	if [ "$CHAINGUARD_AUTH_DONE" = "1" ]; then
+	if [ "$CHAINGUARD_AUTH_DONE" = "1" ] || [ "$CHAINGUARD_AUTH_FAILED" = "1" ]; then
 		return
 	fi
 	if [ -z "$CHAINGUARD_ORG" ]; then
 		info "WARNING: Enterprise APK encountered but no --org specified; skipping."
 		return
 	fi
-	type chainctl 2>&1 >/dev/null || error "Please install [chainctl] to access enterprise APKs."
-	info "Setting up Chainguard auth for org [$CHAINGUARD_ORG]"
-	local token_file
-	token_file=$(mktemp /tmp/chainguard-token.XXXXXX.json)
-	if ! chainctl auth pull-token --parent="${CHAINGUARD_ORG}" -o json 2>/dev/null > "$token_file"; then
-		rm -f "$token_file"
-		error "Could not mint a pull token for [$CHAINGUARD_ORG]. Run 'chainctl auth login' first."
+	# Accept a pull token minted elsewhere. chainctl keeps its credentials in
+	# the system keyring, which is unavailable in a container or a CI job, so
+	# allow the token to be obtained on a machine that can log in and passed
+	# in through the environment.
+	if [ -n "$CHAINGUARD_TOKEN" ]; then
+		IDENTITY="${CHAINGUARD_IDENTITY:-user}"
+		IDENTITY_TOKEN="$CHAINGUARD_TOKEN"
+		CHAINGUARD_AUTH_DONE=1
+		info "Using token from the environment for org [$CHAINGUARD_ORG]"
+		return
 	fi
-	IDENTITY=$(jq -r .identity_id "$token_file")
-	IDENTITY_TOKEN=$(jq -r .token "$token_file")
-	rm -f "$token_file"
+	# Not being able to authenticate is not fatal. A caller without access to
+	# enterprise packages should still collect everything they can reach, and
+	# get a manifest naming what they could not, rather than losing the run.
+	if ! type chainctl >/dev/null 2>&1; then
+		info "WARNING: chainctl not installed; skipping enterprise APKs."
+		info "         Set CHAINGUARD_TOKEN to a token for [$APK_AUDIENCE] instead:"
+		info "         chainctl auth token --audience $APK_AUDIENCE"
+		CHAINGUARD_AUTH_FAILED=1
+		return
+	fi
+	info "Requesting a [$APK_AUDIENCE] token for org [$CHAINGUARD_ORG]"
+	if ! chainguard_apk_token; then
+		# Not logged in, or the token expired. Use the device flow, which
+		# prints a URL to visit instead of opening a browser, so this works
+		# over ssh and anywhere without a display. chainctl blocks until the
+		# login completes, then the run continues.
+		info "Not authenticated for [$APK_AUDIENCE]; starting device login."
+		info "Visit the URL below to authenticate; this will continue automatically."
+		chainctl auth login --headless --audience "$APK_AUDIENCE" || true
+		if ! chainguard_apk_token; then
+			info "WARNING: could not obtain a [$APK_AUDIENCE] token; skipping enterprise APKs."
+			CHAINGUARD_AUTH_FAILED=1
+			return
+		fi
+	fi
+	# apk.cgr.dev takes the token as the basic-auth password and ignores the
+	# username. Unlike a pull token this carries the caller's own entitlement,
+	# so it needs neither identity.create nor IAM write on the org.
+	IDENTITY="user"
 	CHAINGUARD_AUTH_DONE=1
 	info "Chainguard auth configured for org [$CHAINGUARD_ORG]"
 }
 
-# Grant the pull token apk.pull on the org.
-#
-# Only attempted after a pull has actually failed. Creating a role binding
-# requires IAM write on the org, which a customer running this tool usually
-# does not have -- and does not need, since an entitled org already carries
-# apk.pull. Doing this unconditionally locks those callers out entirely.
-grant_apk_pull() {
-	if [ "$CHAINGUARD_BINDING_TRIED" = "1" ]; then
-		return 1
-	fi
-	CHAINGUARD_BINDING_TRIED=1
-	info "Enterprise pull denied; trying to grant apk.pull to [$IDENTITY]"
-	if printf 'y\n' | chainctl iam role-bindings create \
-		--parent="${CHAINGUARD_ORG}" \
-		--identity="${IDENTITY}" \
-		--role=apk.pull 2>/dev/null; then
-		return 0
-	fi
-	info "WARNING: could not create role binding (requires IAM write on [$CHAINGUARD_ORG])"
-	return 1
+# Fetch a token scoped to the APK registry audience
+chainguard_apk_token() {
+	local token
+	token=$(chainctl auth token --audience "$APK_AUDIENCE" 2>/dev/null) || return 1
+	[ -n "$token" ] || return 1
+	IDENTITY_TOKEN="$token"
+	return 0
 }
 
 # Check dependencies and set default values
@@ -712,7 +756,9 @@ mkdir -p "$SOURCES_DIR"
 WORK_DIR=
 CHAINGUARD_ORG=
 CHAINGUARD_AUTH_DONE=0
-CHAINGUARD_BINDING_TRIED=0
+CHAINGUARD_AUTH_FAILED=0
+APK_AUDIENCE="apk.cgr.dev"
+APK_UNAVAILABLE=
 IDENTITY=
 IDENTITY_TOKEN=
 APK_REPOS=
@@ -756,6 +802,10 @@ while [ ! -z "$1" ]; do
 		--no-mirror)
 			MIRROR_FALLBACK=0
 			shift
+		;;
+		--apk-repo)
+			APK_REPOS="$APK_REPOS$2"$'\n'
+			shift 2
 		;;
 		-y|--yes)
 			YES=1

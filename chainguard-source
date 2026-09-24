@@ -16,6 +16,9 @@ Options:
  -P|--privileged		Get sources from private repositories (requires git access)
  --patches-only			Only fetch build configurations and the patches they
 				apply; skip the (very large) upstream source downloads
+ --no-mirror			Do not fall back to the public wolfi-dev/os mirror
+				for build configurations that cannot be resolved at
+				the exact commit named in the SBOM
  -d|--dry-run			Dry run (skip actual source downloads)
  -y|--yes			Automatically answer "y" to acknowledge the
  				warning prompt that this tool will use a lot of
@@ -403,24 +406,55 @@ build_config_checkout() {
 
 	local repo_url="https://github.com/$repo"
 	[ "$PRIVILEGED" = "1" ] && repo_url="git@github.com:$repo"
-	if ! shallow_checkout "$repo_url" "$commit" "$dest"; then
-		# This is the enterprise gap: the config repository is private and we
-		# have no access, so the patch contents are unreachable. Record it
-		# rather than failing, so the manifest reports exactly what is missing.
-		info "WARNING: cannot read build config repo [$repo_url]; patches for [$pkg] unavailable"
-		PATCH_REPO_DENIED="$PATCH_REPO_DENIED$pkg $repo_url"$'\n'
-		return 1
+	if shallow_checkout "$repo_url" "$commit" "$dest"; then
+		collect_from_checkout "$dest" "$path" "$pkg" "$outdir" "exact"
+		return 0
+	fi
+	info "WARNING: cannot read build config repo [$repo_url]"
+
+	# Public Wolfi packages are built out of a private monorepo, and their
+	# SBOMs point at it -- so even a wholly open source package's provenance
+	# reference is unresolvable for anyone outside Chainguard. The same build
+	# configurations and patches are mirrored in the public wolfi-dev/os
+	# repository, so fall back to that. The exact build commit does not exist
+	# there, so anything retrieved this way is marked as a mirror copy rather
+	# than as the exact source of the build.
+	if [ "$MIRROR_FALLBACK" = "1" ] && [ "$repo" != "$WOLFI_MIRROR" ]; then
+		local mdest="$WORK_DIR/build-configs/$WOLFI_MIRROR@HEAD"
+		info "Trying public mirror [$WOLFI_MIRROR] for [$pkg]"
+		if shallow_checkout "https://github.com/$WOLFI_MIRROR" "HEAD" "$mdest" \
+			&& [ -f "$mdest/$pkg.yaml" ]; then
+			collect_from_checkout "$mdest" "$pkg.yaml" "$pkg" "$outdir" "mirror"
+			return 0
+		fi
+		info "WARNING: [$pkg] not found in public mirror [$WOLFI_MIRROR]"
 	fi
 
-	# Save the build configuration itself next to the patches
+	# Nothing reachable, so the patch contents are unavailable. Record it
+	# rather than failing, so the manifest reports exactly what is missing.
+	info "WARNING: patches for [$pkg] unavailable"
+	PATCH_REPO_DENIED="$PATCH_REPO_DENIED$pkg $repo_url"$'\n'
+	return 1
+}
+
+# Copy a build configuration and the patches beside it out of a checkout, and
+# record where they came from so the manifest can distinguish patches taken
+# from the exact build commit from those taken from a public mirror.
+collect_from_checkout() {
+	local dest="$1"
+	local path="$2"
+	local pkg="$3"
+	local outdir="$4"
+	local provenance="$5"
+	local supportdir=
 	mkdir -p "$outdir"
 	[ -f "$dest/$path" ] && cp -a "$dest/$path" "$outdir/$pkg.yaml"
-
 	supportdir="$dest/$(dirname $path)/$pkg"
 	if [ -d "$supportdir" ]; then
-		info "Collecting patches for [$pkg] from [$repo]"
+		info "Collecting patches for [$pkg] ($provenance)"
 		cp -a "$supportdir/." "$outdir/"
 	fi
+	echo "$provenance" > "$outdir/.provenance"
 	return 0
 }
 
@@ -447,31 +481,49 @@ shallow_checkout() {
 # Reconcile what the build configurations say was applied against what we
 # actually retrieved, and write it out as evidence.
 summarize_patches() {
-	local config= pkg= outdir= p= status= total=0 missing=0
+	local config= pkg= outdir= p= pbase= status= provenance=
+	local total=0 missing=0 mirrored=0
 	local manifest="$WORK_DIR/patches/MANIFEST.txt"
+	local rows=
 	[ -d "$WORK_DIR" ] || return 0
 	mkdir -p "$WORK_DIR/patches"
-	: > "$manifest"
-	printf '%-10s %-40s %s\n' "STATUS" "PACKAGE" "PATCH" >> "$manifest"
+	rows=$(mktemp)
 	while IFS= read -r config; do
 		[ -z "$config" ] && continue
 		pkg=$(melange_pkg_name "$config") || pkg=$(basename "$config" .melange.yaml)
 		outdir=$(patchdir_for_pkg "$pkg")
+		provenance="exact"
+		[ -f "$outdir/.provenance" ] && provenance=$(cat "$outdir/.provenance")
 		while IFS= read -r p; do
 			[ -z "$p" ] && continue
-			total=$((total+1))
-			if [ -f "$outdir/$p" ]; then
-				status="OK"
-			else
+			# Patch paths in a build configuration are relative to the build
+			# workspace, so they routinely start with ../; only the filename
+			# is meaningful for locating what we retrieved.
+			pbase=$(basename "$p")
+			if [ ! -f "$outdir/$pbase" ]; then
 				status="MISSING"
-				missing=$((missing+1))
+			elif [ "$provenance" = "mirror" ]; then
+				status="MIRROR"
+			else
+				status="OK"
 			fi
-			printf '%-10s %-40s %s\n' "$status" "$pkg" "$p" >> "$manifest"
+			printf '%-10s %-40s %s\n' "$status" "$pkg" "$pbase" >> "$rows"
 		done <<< "$(melange_patch_list "$config" "$outdir")"
 	done <<< "$(find "$WORK_DIR" -name '*.melange.yaml' 2>/dev/null | sort)"
 
+	# The same package is reached by more than one SBOM reference, so the same
+	# patch can be recorded several times; report each one once.
+	{
+		printf '%-10s %-40s %s\n' "STATUS" "PACKAGE" "PATCH"
+		sort -u "$rows"
+	} > "$manifest"
+	total=$(sort -u "$rows" | grep -c . || true)
+	missing=$(sort -u "$rows" | grep -c '^MISSING' || true)
+	mirrored=$(sort -u "$rows" | grep -c '^MIRROR' || true)
+	rm -f "$rows"
+
 	info "Patch manifest written to [$manifest]"
-	info "Patches applied: [$total]  retrieved: [$((total-missing))]  missing: [$missing]"
+	info "Patches applied: [$total]  retrieved: [$((total-missing))]  from mirror: [$mirrored]  missing: [$missing]"
 	if [ -n "$PATCH_REPO_DENIED" ]; then
 		echo
 		echo "The following build configuration repositories could not be read,"
@@ -666,6 +718,8 @@ IDENTITY_TOKEN=
 APK_REPOS=
 PATCHES_ONLY=0
 PATCH_REPO_DENIED=
+MIRROR_FALLBACK=1
+WOLFI_MIRROR="wolfi-dev/os"
 
 # Handle command line options
 while [ ! -z "$1" ]; do
@@ -697,6 +751,10 @@ while [ ! -z "$1" ]; do
 		;;
 		--patches-only)
 			PATCHES_ONLY=1
+			shift
+		;;
+		--no-mirror)
+			MIRROR_FALLBACK=0
 			shift
 		;;
 		-y|--yes)

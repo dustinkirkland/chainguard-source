@@ -55,13 +55,17 @@ patch files themselves, in this order:
    read the patches applied to it. This is the path that works for enterprise
    packages. melange does not ship patches here yet; when it does, this lights
    up with no further changes to this tool.
-2. **From the melange build configuration repository** referenced by the SBOM
-   (`pkg:github/wolfi-dev/os@<commit>#python-3.13.yaml`), checked out at the
-   exact build commit. Patches live in a directory named after the
-   configuration, right next to it. Wolfi's repository is public, so this needs
-   no credentials. Build configurations for enterprise packages live in a
-   private repository, so those only resolve with `--privileged` and source
-   access.
+2. **From the melange build configuration repository** referenced by the SBOM,
+   checked out at the exact build commit. Patches live in a directory named
+   after the configuration, right next to it.
+3. **From the public `wolfi-dev/os` mirror**, if the repository named by the
+   SBOM cannot be read. Public Wolfi packages are built out of a private
+   monorepo and their SBOMs point at it, so even a wholly open source package's
+   provenance reference is unresolvable from outside Chainguard. The same
+   configurations and patches are mirrored publicly, so they are still
+   retrievable — but the exact build commit does not exist in the mirror, so
+   anything obtained this way is reported as `MIRROR` rather than `OK`. Pass
+   `--no-mirror` to disable this and accept only exact-commit provenance.
 
 To collect build configurations and patches without downloading gigabytes of
 upstream source, use `--patches-only`:
@@ -79,14 +83,17 @@ of what was applied against what was actually retrieved in
 ```
 STATUS     PACKAGE                                  PATCH
 OK         busybox                                  CVE-2025-46394.patch
-OK         python-3.13                              gh-127301.patch
+MIRROR     python-3.13                              gh-127301.patch
 MISSING    some-enterprise-package                  some-fix.patch
 ```
 
-A `MISSING` row means the build applied that patch to software you received,
-but its contents could not be retrieved — today, that is every patch belonging
-to an enterprise package, for any caller without access to the private build
-configuration repository.
+- `OK` — retrieved from the exact source the build used.
+- `MIRROR` — retrieved from the public mirror, which carries the same patch but
+  cannot be pinned to the build commit named in the SBOM.
+- `MISSING` — the build applied that patch to software you received, but its
+  contents could not be retrieved at all. Today that is every patch belonging
+  to an enterprise package, for any caller without access to the private build
+  configuration repository.
 
 # Tests
 
